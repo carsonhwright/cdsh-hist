@@ -3,11 +3,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <regex.h>
 #include "cd-hist.h"
 
 #define MAX_LINE 80 /* The max lenght cmd*/
 #define MAX_LEN 255 // max length of input command
-/* The max size of the history buffer, this is not the same as the number of commands that can be stored in history, but it is a limit on the total size of the history buffer. */
+/*  The max size of the history buffer, this is not the same as the number of commands that can be 
+    stored in history, but it is a limit on the total size of the history buffer. */
 #define HISTORY_BUF_SIZE MAX_LEN * (MAX_HIST + 1)
 #define MAX_PARAMS 12 // greatest number of parameters a command can have
 
@@ -24,11 +26,17 @@ int main(void) {
 
     int should_run = 1; // flag to determine when to exit main loop
     char *buf = malloc(MAX_LEN * sizeof(char));
+    regex_t task_repeat_regex;
+    if (regcomp(&task_repeat_regex, "!(!|1?[0-9])", REG_EXTENDED)) {
+        fprintf(stderr, "REGEX compilation error! Exiting.\n");
+        return 1;
+    }
 
     // buffer for history of previous commands
     struct history hist_buf;
-    memset(hist_buf.commands, 0, MAX_HIST*sizeof(char*));
+    memset(hist_buf.commands, 0, MAX_HIST*sizeof(struct command));
     hist_buf.top = 0;
+    hist_buf.commands[0].counter = 0;
 
     int is_wait = 0; // flag to determine if the command should be run in the background or not
     __pid_t pid;
@@ -50,23 +58,30 @@ int main(void) {
         // setup params for the next command
         memset(params, 0, MAX_PARAMS * sizeof(char*));
         memset(buf, 0, MAX_LEN*sizeof(char));
+
         // print the "shell" and get input
         printf("$ cdsh> ");
         fflush(stdout);
         fgets(buf, MAX_LEN*sizeof(char), stdin);
-        // kind of a bad name, but this will reformat the input for execvp
+
+        if (rollback(buf, &hist_buf, &task_repeat_regex)) {
+            // historical rollback command was incorrect
+            continue;
+        }
         push_history(&hist_buf, buf);
         split(buf, command, params, &is_wait);
         if (strcmp(command, "exit") == 0) {
             should_run = 0;
             continue;
         } else if (strcmp(command, "history") == 0) {
-            for(int i=0; i < sizeof(hist_buf.commands) / sizeof(char*) - 1; i++) {
+            for(int i=0; i <= (sizeof(hist_buf.commands) / sizeof(struct command)) - 1; i++) {
                 // as long as the buffer entry isn't empty, print it
-                if (hist_buf.commands[i] != 0){
-                    printf("%s", hist_buf.commands[i]);
+                if (hist_buf.commands[i].command != 0){
+                    printf("%d %s", hist_buf.commands[i].counter, hist_buf.commands[i].command);
                 }
             }
+            // nothing needs to be executed by the system
+            continue;
         }
 
         pid = fork();
@@ -103,6 +118,7 @@ int main(void) {
     }
     free(buf);
     free(command);
+    regfree(&task_repeat_regex);
     buf = NULL;
     return 0;
 }
@@ -138,20 +154,48 @@ void split(char *input, char* command, char** params, int* is_wait) {
 
         *params++ = token;
         token = temp;
-        
     }
 }
 
 /*
-    history.commands act as a LIFO buffer, but with no pop, they are only to be viewed
+    if !!, or !N was sent to shell, retreive the most recent or Nth most recent command 
+    respectively and overwrite the buffer with it so that it can be executed
+*/
+int rollback(char* buffer, struct history* history, regex_t* regexp) {
+    int regex_err;
+    int nth_cmd = 0;
+    regex_err = regexec(regexp, buffer, 0, NULL, 0);
+    // printf(buffer);
+    if (!regex_err) {
+        
+        if (buffer[1] == '!') {
+            // get the latest response
+            memset(buffer, 0, MAX_LEN*sizeof(char));
+            strcpy(buffer, history->commands[history->top - 1].command);
+            return 0;
+        } else {
+            // TODO this won't work for values greater than 9
+            nth_cmd = buffer[1] - '0';
+            if (nth_cmd < 0 || nth_cmd > 9) {
+                return 1;
+            } else if (history->top - (nth_cmd + 1) < 0) {
+                // user gave an argument greater than current buffer position, and buffer not 
+                // full, setting to first cmd
+                nth_cmd = history->top;
+            }
+            memset(buffer, 0, MAX_LEN*sizeof(char));
+            strcpy(buffer, history->commands[history->top - (nth_cmd + 1)].command);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/*
+    history.commands are a readonly circular buffer, this updates said buffer and updates some 
+    niceness for printing history if ever it is accessed
 */
 void push_history(struct history* history, char* command) {
-    char *command_copy = malloc(strlen(command) + 1);
-    if (command_copy == NULL) {
-        fprintf(stderr, "History allocation failed\n");
-        return;
-    }
-    strcpy(command_copy, command);
 
     if (history->top == MAX_HIST) {
 
@@ -159,6 +203,15 @@ void push_history(struct history* history, char* command) {
             history->commands[i] = history->commands[i+1];
         }
         history->top--;
+        
     }
-    history->commands[history->top++] = command_copy;
+
+    if (!history->top) {
+        history->commands[history->top].counter = 1;
+    } else {
+        history->commands[history->top].counter = 
+            history->commands[(history->top - 1)].counter + 1;
+    }
+    history->commands[history->top].command = malloc(strlen(command) + 3); //still don't remember why + 3
+    strcpy(history->commands[history->top++].command, command);
 }
